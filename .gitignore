@@ -1,0 +1,16 @@
+# Runtime data, model assets, and generated output (code-only repository)
+/assets/
+/logs/
+/work/
+/pal_mjlab/
+/tools/
+/outputs/
+__pycache__/
+*.py[cod]
+*.pt
+*.pth
+*.mp4
+*.npz
+*.log
+.venv/
+.env
