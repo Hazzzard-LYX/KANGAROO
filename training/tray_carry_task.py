@@ -2,12 +2,12 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 import copy
 from pathlib import Path
 
 import mujoco
+import numpy as np
 import torch
 from mjlab.entity import EntityCfg
 from mjlab.managers.event_manager import EventTermCfg
@@ -24,6 +24,7 @@ from gripper_walking_model import ROOT, apply_gripper_model, gripper_spec
 TASK_ID = "Mjlab-Velocity-Flat-Kangaroo-Tray-Carry"
 POSE_PATH = ROOT / "assets/tray/carry_pose.json"
 TRAY_MASS = 0.1
+TRAY_STL_PATH = ROOT / "assets/tray/tray_handles_tilted.stl"
 # Saved tray pose relative to the base link and pelvis/arm frame respectively.
 TRAY_REL_POS_BASE = torch.tensor([0.2502660259, -0.2, -0.023], dtype=torch.float32)
 TRAY_REL_POS_TORSO = torch.tensor([0.34206578, -0.2, -0.0886], dtype=torch.float32)
@@ -31,10 +32,51 @@ TRAY_REL_QUAT = torch.tensor([0.5, 0.5, 0.5, 0.5], dtype=torch.float32)
 
 
 def tray_spec() -> mujoco.MjSpec:
-    """Contact model: thin tray floor and two rounded handle posts, total mass 100 g."""
+    """Build the 100 g tray with physical pan and handle contact geometry.
+
+    The full concave STL is visual-only. MuJoCo collision meshes are convex, so
+    each tilted handle is extracted separately from the STL and convexified on
+    its own; the pan uses a thin box collider. No robot/tray equality constraints
+    are used: grasping must come from finger contact and friction.
+    """
     spec = mujoco.MjSpec()
-    src = ROOT / "assets/tray/tray_original.stl"
-    spec.add_mesh(name="tray_visual", file=str(src), scale=[0.001] * 3)
+    spec.add_mesh(name="tray_visual", file=str(TRAY_STL_PATH), scale=[0.001] * 3)
+
+    # The STL is exported in millimetres. Each handle is the closed band between
+    # y=0..100 mm at one end of x; these coordinate windows exclude the pan and
+    # let MuJoCo form two small convex contact meshes instead of the whole-tray hull.
+    import trimesh
+
+    tray_mesh = trimesh.load_mesh(str(TRAY_STL_PATH), process=True)
+    triangles = tray_mesh.triangles
+    handle_mesh_data = {}
+    for side, x_range in (("left", (20.0, 80.0)), ("right", (320.0, 380.0))):
+        mask = (
+            (triangles[:, :, 1].min(axis=1) >= 0.0)
+            & (triangles[:, :, 1].max(axis=1) <= 100.0)
+            & (triangles[:, :, 2].min(axis=1) >= 180.0)
+            & (triangles[:, :, 2].max(axis=1) <= 270.0)
+            & (triangles[:, :, 0].min(axis=1) >= x_range[0])
+            & (triangles[:, :, 0].max(axis=1) <= x_range[1])
+        )
+        selected = triangles[mask]
+        if len(selected) == 0:
+            raise ValueError(f"No {side} handle triangles found in {TRAY_STL_PATH}")
+        vertices = np.unique(selected.reshape(-1, 3), axis=0)
+        vertex_ids = {tuple(vertex): idx for idx, vertex in enumerate(vertices)}
+        faces = np.asarray(
+            [[vertex_ids[tuple(vertex)] for vertex in face] for face in selected],
+            dtype=np.int32,
+        )
+        mesh_name = f"tray_handle_{side}_contact"
+        spec.add_mesh(
+            name=mesh_name,
+            uservert=(vertices * 0.001).reshape(-1).tolist(),
+            userface=faces.reshape(-1).tolist(),
+            maxhullvert=64,
+        )
+        handle_mesh_data[side] = mesh_name
+
     body = spec.worldbody.add_body(name="tray")
     body.add_freejoint(name="tray_free")
     # The original part is 400 x 300 mm. Its CAD origin has the same rotation and
@@ -49,42 +91,20 @@ def tray_spec() -> mujoco.MjSpec:
     solref=(0.01, 1.0), solimp=(0.98, 0.995, 0.001, 0.5, 2.0))
     body.add_geom(
         name="tray_pan_collision", type=mujoco.mjtGeom.mjGEOM_BOX,
-        pos=(0.2, 0.125, 0.15), size=(0.2, 0.025, 0.15), mass=0.07,
+        # Match the CAD pan plate (y=100..130 mm), rather than the old
+        # oversized proxy that added 20 mm of invisible material.
+        pos=(0.2, 0.115, 0.15), size=(0.2, 0.015, 0.15), mass=0.07,
+        contype=1, conaffinity=1,
         rgba=(0.22, 0.55, 0.82, 0.0), **contact,
     )
-    post_quat = (math.sqrt(0.5), -math.sqrt(0.5), 0.0, 0.0)
-    for idx, x in enumerate((0.05, 0.35)):
+    for side in ("left", "right"):
         body.add_geom(
-            name=f"tray_handle_{idx}_collision", type=mujoco.mjtGeom.mjGEOM_ELLIPSOID,
-            pos=(x, 0.05, 0.225), quat=post_quat, size=(0.018, 0.05, 0.03),
-            mass=0.015, contype=0, conaffinity=0,
+            name=f"tray_handle_{side}_collision", type=mujoco.mjtGeom.mjGEOM_MESH,
+            meshname=handle_mesh_data[side], mass=0.015,
+            contype=1, conaffinity=1,
             rgba=(0.22, 0.55, 0.82, 0.0), **contact,
         )
-    body.add_site(name="carry_anchor_right", pos=(0.05, 0.05, 0.225), size=(0.004,))
-    body.add_site(name="carry_anchor_left", pos=(0.35, 0.05, 0.225), size=(0.004,))
     return spec
-
-
-def add_grasp_constraints(spec: mujoco.MjSpec):
-    """Latch each modeled handle to its matching gripper at the saved fit pose."""
-    # The coordinates were derived from the saved pose's arm kinematics. Sites
-    # follow the hand links; site-to-site constraints work across every reset yaw.
-    hand_anchors = {
-        "left": ((-0.00067423, -0.01055860, 0.18386543),
-                 (0.96378140, -0.00578730, 0.26620066, -0.01513695)),
-        "right": ((0.00066353, -0.01051582, 0.18386666),
-                  (-0.96377914, 0.00581892, 0.26620957, -0.01511172)),
-    }
-    for side, (local_pos, local_quat) in hand_anchors.items():
-        hand = spec.body(f"robot/arm_{side}_7_link")
-        hand.add_site(name=f"robot_carry_anchor_{side}", pos=local_pos,
-                      quat=local_quat, size=(0.004,))
-        eq = spec.add_equality(name=f"tray_grasp_{side}")
-        eq.type = mujoco.mjtEq.mjEQ_WELD if side == "left" else mujoco.mjtEq.mjEQ_CONNECT
-        eq.objtype = mujoco.mjtObj.mjOBJ_SITE
-        eq.name1 = f"tray/carry_anchor_{side}"
-        eq.name2 = f"robot_carry_anchor_{side}"
-        eq.solref = (0.01, 1.0)
 
 
 def tray_reset(env, env_ids: torch.Tensor, tray_cfg: SceneEntityCfg, robot_cfg: SceneEntityCfg):
@@ -191,7 +211,6 @@ def carry_env_cfg(play: bool = False):
             joint_pos={}, joint_vel={},
         ),
     )
-    cfg.scene.spec_fn = add_grasp_constraints
     cfg.events["hold_nominal_targets"] = EventTermCfg(
         func=hold_nominal_targets, mode="reset", params={"robot_cfg": SceneEntityCfg("robot")}
     )

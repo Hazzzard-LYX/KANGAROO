@@ -97,7 +97,7 @@ def main() -> None:
     report = {
         "checkpoint": str(args.checkpoint.resolve()),
         "seconds": args.seconds, "envs": args.envs, "seed": args.seed,
-        "grasp_assumption": "bilateral no-slip site constraints; tray remains a 0.1 kg free body",
+        "grasp_assumption": "physical gripper-finger contact and friction; tray remains a 0.1 kg free body",
         "standing_survival_rate": rate,
         "mean_time_to_failure_s": failed_at.mean().item(),
         "tray_relative_position_rmse_m": position_rmse,

@@ -43,7 +43,7 @@ def main() -> None:
         "seed": cfg.agent.seed, "resume_checkpoint": str(checkpoint),
         "task_id": tray_carry_task.TASK_ID, "command": "velocity_tracking_curriculum",
         "tray_mass_kg": tray_carry_task.TRAY_MASS,
-        "grasp_model": "bilateral no-slip site constraints; 100 g free-body dynamics",
+        "grasp_model": "physical gripper-finger contact and friction; 100 g free-body dynamics",
         "automation_id": "kangaroo",
     }
     record_path.write_text(json.dumps(record, indent=2) + "\n")
