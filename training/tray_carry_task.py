@@ -22,12 +22,13 @@ import walking_task
 from gripper_walking_model import ROOT, apply_gripper_model, gripper_spec
 
 TASK_ID = "Mjlab-Velocity-Flat-Kangaroo-Tray-Carry"
-POSE_PATH = ROOT / "assets/tray/carry_pose.json"
+POSE_PATH = ROOT / "assets/tray/carry_reset_pose.json"
 TRAY_MASS = 0.1
-TRAY_STL_PATH = ROOT / "assets/tray/tray_handles_tilted.stl"
+TRAY_STL_PATH = ROOT / "assets/tray/tray_revision7.stl"
 # Saved tray pose relative to the base link and pelvis/arm frame respectively.
-TRAY_REL_POS_BASE = torch.tensor([0.2502660259, -0.2, -0.023], dtype=torch.float32)
-TRAY_REL_POS_TORSO = torch.tensor([0.34206578, -0.2, -0.0886], dtype=torch.float32)
+# User-edited pose (contact pose editor): pan resting on the gripper palm colliders.
+TRAY_REL_POS_BASE = torch.tensor([0.23, -0.2, -0.020], dtype=torch.float32)
+TRAY_REL_POS_TORSO = torch.tensor([0.3218, -0.2, -0.0856], dtype=torch.float32)  # measured at reset
 TRAY_REL_QUAT = torch.tensor([0.5, 0.5, 0.5, 0.5], dtype=torch.float32)
 
 
@@ -81,7 +82,7 @@ def tray_spec() -> mujoco.MjSpec:
     body.add_freejoint(name="tray_free")
     # The original part is 400 x 300 mm. Its CAD origin has the same rotation and
     # translation convention as the static editor. Collisions are decomposed into a
-    # shallow pan and two elliptical posts so the concave pan is not convex-hull filled.
+    # shallow pan and two separate handle meshes so the concave pan is not convex-hull filled.
     body.add_geom(
         name="tray_visual_geom", type=mujoco.mjtGeom.mjGEOM_MESH,
         meshname="tray_visual", density=0.0, contype=0, conaffinity=0,
@@ -190,8 +191,8 @@ def tray_fallen(env, tray_cfg: SceneEntityCfg, robot_cfg: SceneEntityCfg):
 def carry_env_cfg(play: bool = False):
     cfg = walking_task.walking_env_cfg(play=play)
     # Preserve the actor/critic dimensions of the unloaded walking policy for a warm start.
-    # Keep the seven arm joints fixed at the grasp pose while leaving the waist
-    # available to the walking policy for balance.
+    # Hold arm position targets at the grasp pose while leaving the waist
+    # available to the walking policy. Position targets do not rigidly lock joints.
     robot = cfg.scene.entities["robot"]
     pose = json.loads(POSE_PATH.read_text())
     default = {k: v for k, v in robot.init_state.joint_pos.items()
@@ -207,7 +208,7 @@ def carry_env_cfg(play: bool = False):
     cfg.scene.entities["tray"] = EntityCfg(
         spec_fn=tray_spec,
         init_state=EntityCfg.InitialStateCfg(
-            pos=(0.2502660259, -0.2, 0.877), rot=(0.5, 0.5, 0.5, 0.5),
+            pos=(0.23, -0.2, 0.880), rot=(0.5, 0.5, 0.5, 0.5),
             joint_pos={}, joint_vel={},
         ),
     )

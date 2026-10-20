@@ -13,8 +13,8 @@ from gripper_walking_model import ROOT, gripper_spec
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--target-gap-m", type=float, default=0.048,
-        help="Finger-tip separation; 48 mm gives slight preload on the tilted STL handles.",
+        "--target-gap-m", type=float, default=0.046,
+        help="Distance between fingertip sites; does not by itself validate collision clearance or grasp force.",
     )
     args = parser.parse_args()
     # Preserve the calibrated arm placement when recomputing gripper linkage
@@ -65,7 +65,7 @@ def main():
         for joint_id, value in zip(ids, result.x, strict=True):
             pose["joint_positions_rad"][model.joint(joint_id).name] = float(value)
     pose["target_handle_gap_m"] = args.target_gap_m
-    pose["note"] = "Tray carry pose; arm coordinates from user pose; gripper linkage solved for preloaded physical contact on the tilted STL handles."
+    pose["note"] = "Calibrated arm pose; gripper linkage solved for the specified fingertip-site gap. Static fit only; stable physical grasp is not implied."
     pose_path.write_text(json.dumps(pose, indent=2))
 
 
