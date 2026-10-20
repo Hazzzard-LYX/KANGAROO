@@ -43,6 +43,11 @@ def main() -> None:
     parser.add_argument("--viewer-fps", type=float, default=30.0)
     parser.add_argument("--seed", type=int, default=47)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--resume-checkpoint", type=Path, default=None,
+                        help="Load actor, critic and optimizer from this checkpoint.")
+    parser.add_argument("--initial-frontier", type=float, default=0.0, help="Curriculum frontier at start.")
+    parser.add_argument("--env-spacing", type=float, default=None, help="Distance between env origins (m).")
+    parser.add_argument("--show-envs", type=int, default=0, help="Neighbouring envs drawn in the viewer.")
     args = parser.parse_args()
     if min(args.num_envs, args.iterations, args.save_interval, args.viewer_fps) <= 0:
         parser.error("Environment count, iterations, save interval and viewer FPS must be positive")
@@ -56,9 +61,12 @@ def main() -> None:
     signal.signal(signal.SIGTERM, interrupt_training)
 
     configure_torch_backends()
+    loaded_carry_task.INITIAL_FRONTIER = args.initial_frontier
     cfg = TrainConfig.from_task(loaded_carry_task.TASK_ID)
+    if args.env_spacing is not None:
+        cfg.env.scene.env_spacing = args.env_spacing
     cfg.env.scene.num_envs = args.num_envs
-    cfg.env.viewer.max_extra_envs = 0
+    cfg.env.viewer.max_extra_envs = args.show_envs
     cfg.env.viewer.entity_name = "robot"
     cfg.env.viewer.distance = 2.5
     cfg.env.viewer.elevation = -15.0
@@ -66,7 +74,7 @@ def main() -> None:
     cfg.agent.resume = False
     cfg.agent.max_iterations = args.iterations
     cfg.agent.save_interval = args.save_interval
-    cfg.agent.run_name = f"grip_v2_live_{args.num_envs}env"
+    cfg.agent.run_name = f"blocks_v5_live_{args.num_envs}env"
 
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     log_dir = root / "logs/rsl_rl" / cfg.agent.experiment_name / f"{stamp}_{cfg.agent.run_name}"
@@ -83,16 +91,19 @@ def main() -> None:
     commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     record = {
         "pid": os.getpid(),
-        "phase": "loaded_carry_grip_v2_live",
+        "phase": "loaded_carry_blocks_v5_live",
         "started": datetime.now().astimezone().isoformat(),
         "num_envs": args.num_envs,
         "iterations": args.iterations,
         "seed": args.seed,
-        "resume_checkpoint": None,
+        "resume_checkpoint": None if args.resume_checkpoint is None else str(args.resume_checkpoint.resolve()),
+        "initial_frontier": args.initial_frontier,
+        "env_spacing": cfg.env.scene.env_spacing,
+        "show_envs": args.show_envs,
         "task_id": loaded_carry_task.TASK_ID,
         "pose_file": str(loaded_carry_task.POSE_PATH),
         "tray_mesh": str(loaded_carry_task.TRAY_STL_PATH),
-        "rewards_added": ["grip_pinch", "grip_slip", "arm7_support", "torque_limit"],
+        "rewards_added": ["arm_torque", "arm7_level"],
         "branch": branch,
         "commit": commit,
         "uncommitted_changes": True,
@@ -111,11 +122,15 @@ def main() -> None:
         runner_cls = load_runner_cls(loaded_carry_task.TASK_ID)
         runner = runner_cls(env, asdict(cfg.agent), str(log_dir), args.device)
         runner.add_git_repo_to_log(__file__)
+        if args.resume_checkpoint is not None:
+            runner.load(str(args.resume_checkpoint.resolve()))
+            print(f"[INFO] Resumed from {args.resume_checkpoint.resolve()}", flush=True)
         # Render the actual PPO rollout. Do not run a separate inference/play environment.
         viewer = TrainingViewer(env, policy=lambda _obs: None, frame_rate=args.viewer_fps)
         viewer.setup()
         # This mjlab version otherwise renders every other environment on the CPU.
-        viewer.vd = None
+        if args.show_envs == 0:
+            viewer.vd = None
         viewer._show_debug_vis = False
         env_step = env.step
         next_render = 0.0

@@ -90,6 +90,7 @@ PROMOTE_SURVIVAL = 0.85   # frontier pass rate (survive + track) that moves the 
 DEMOTE_SURVIVAL = 0.50    # ... and below which it moves down
 FRONTIER_STEP = 0.1       # levels per decision
 WINDOW_EPISODES = 256     # frontier episodes per decision
+INITIAL_FRONTIER = 0.0    # curriculum frontier at start (launchers may override before building the env)
 # An episode passes when it lasts the full length AND its mean xy velocity error is below this
 # (2026-10-19: survival alone let a standing-still policy reach 6 kg at full speed).
 TRACK_PASS_ERROR = 0.2    # m/s
@@ -122,7 +123,7 @@ class LoadCurriculum:
         # Step at which each env's current episode was drawn; -1 = not drawn by the
         # curriculum (e.g. episodes shortened by the runner's random initial lengths).
         self.start_step = torch.full((num_envs,), -1, dtype=torch.long, device=device)
-        self.frontier = 0.0
+        self.frontier = float(INITIAL_FRONTIER)
         self.window_passed = 0
         self.window_survived = 0
         self.window_total = 0
