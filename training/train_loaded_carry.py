@@ -22,8 +22,10 @@ def main() -> None:
     parser.add_argument("--run-name", default="scratch")
     parser.add_argument("--resume-checkpoint", type=Path, default=None,
                         help="Load actor, critic and optimizer from this checkpoint (same experiment).")
+    parser.add_argument("--initial-frontier", type=float, default=0.0, help="Curriculum frontier at start.")
     args = parser.parse_args()
 
+    loaded_carry_task.INITIAL_FRONTIER = args.initial_frontier
     cfg = TrainConfig.from_task(loaded_carry_task.TASK_ID)
     cfg.env.scene.num_envs = args.num_envs
     cfg.agent.resume = args.resume_checkpoint is not None
@@ -42,7 +44,7 @@ def main() -> None:
                             capture_output=True, text=True).stdout.strip()
     record = {
         "pid": os.getpid(),
-        "phase": "loaded_carry_scratch",
+        "phase": "loaded_carry_v5_blocks" if args.run_name.startswith("blocks") else "loaded_carry",
         "started": datetime.now().astimezone().isoformat(),
         "task_id": loaded_carry_task.TASK_ID,
         "num_envs": args.num_envs,
@@ -63,6 +65,8 @@ def main() -> None:
             "demote_pass_rate": loaded_carry_task.DEMOTE_SURVIVAL,
             "pass": "full episode and mean xy velocity error < %.2f m/s" % loaded_carry_task.TRACK_PASS_ERROR,
             "replay_prob": loaded_carry_task.REPLAY_PROB,
+            "initial_frontier": args.initial_frontier,
+            "levels_meaning": "number of 1 kg blocks on a 1 kg tray (total 1 + level kg)",
         },
     }
     (root / "logs/active_training.json").write_text(json.dumps(record, indent=2) + "\n")
