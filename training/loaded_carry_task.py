@@ -13,6 +13,7 @@ import json
 import math
 import re
 
+import mujoco
 import torch
 from mjlab.entity import EntityCfg
 from mjlab.envs.mdp.actions import JointPositionActionCfg
@@ -65,9 +66,23 @@ TRAY_TILT_SIGMA = math.radians(5.0)  # tray-level penalty width (world vertical)
 GRIP_PARALLEL_SIGMAS = (math.radians(20.0), math.radians(3.0))
 
 # Curriculum: level k in 0..N_LEVELS-1. Mass and speed scale rise together.
-N_LEVELS = 11
-MASS_MIN, MASS_MAX = 1.0, 6.0
-SPEED_SCALE_MIN = 0.3
+# V5 (2026-10-20): a 1 kg tray carrying 0-7 steel blocks (1 kg, 50 mm cubes) at random,
+# non-overlapping slots on the pan. Curriculum level k = number of blocks, total 1 + k kg.
+TRAY_BASE_MASS = 1.0
+BLOCK_MASS, BLOCK_SIZE, MAX_BLOCKS = 1.0, 0.05, 7
+N_LEVELS = MAX_BLOCKS + 1
+MASS_MIN, MASS_MAX = TRAY_BASE_MASS, TRAY_BASE_MASS + MAX_BLOCKS * BLOCK_MASS
+SPEED_SCALE_MIN = 1.0   # V4 already tracks the full speed range at every mass
+# Block slots in the tray (CAD) frame, metres: CAD x = robot left/right, CAD z = fore/aft,
+# CAD y = up. Pan top at y = 0.13 (collision box 0.10..0.13). 4 x 3 grid, 90 mm pitch,
+# +/-15 mm jitter per block, so 50 mm blocks never overlap.
+BLOCK_SLOTS_X = (0.065, 0.155, 0.245, 0.335)
+BLOCK_SLOTS_Z = (0.06, 0.15, 0.24)
+BLOCK_JITTER = 0.015
+PAN_TOP_Y = 0.13
+PAN_CENTRE = (0.2, PAN_TOP_Y, 0.15)
+# Arm effort (V5): sum over the 14 arm joints of (|tau| / limit)^2; arm_7 level w.r.t. gravity.
+ARM_TORQUE_WEIGHT = -0.5
 FINAL_RANGES = dict(lin_vel_x=(-0.6, 1.2), lin_vel_y=(-0.2, 0.2), ang_vel_z=(-0.6, 0.6))
 FRONTIER_SIGMA = 0.7      # width of the sampling bump around the frontier (levels)
 REPLAY_PROB = 0.2         # share of resets drawn uniformly from the levels below the frontier
@@ -206,6 +221,39 @@ def load_curriculum(env, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
 _TRAY_DEFAULTS: dict[str, torch.Tensor] = {}
 
 
+@requires_model_fields("body_mass", "body_inertia", "body_pos", "geom_rgba",
+                       recompute=RecomputeLevel.set_const)
+def place_tray_blocks(env, env_ids: torch.Tensor, tray_cfg: SceneEntityCfg):
+    """Activate `level` blocks at random distinct slots (with jitter); park the others."""
+    ids = getattr(env, "_block_ids", None)
+    if ids is None:
+        mj = env.sim.mj_model
+        ids = {"body": torch.tensor([mj.body(f"{tray_cfg.name}/block_{i}").id for i in range(MAX_BLOCKS)], device=env.device),
+               "geom": torch.tensor([mj.geom(f"{tray_cfg.name}/block_{i}_geom").id for i in range(MAX_BLOCKS)], device=env.device)}
+        sx, sz = torch.meshgrid(torch.tensor(BLOCK_SLOTS_X), torch.tensor(BLOCK_SLOTS_Z), indexing="ij")
+        ids["slots"] = torch.stack((sx.flatten(), torch.full_like(sx.flatten(), PAN_TOP_Y + BLOCK_SIZE / 2),
+                                    sz.flatten()), dim=-1).to(env.device)
+        ids["inertia"] = torch.full((3,), BLOCK_MASS * BLOCK_SIZE**2 / 6.0, device=env.device)
+        env._block_ids = ids
+    n_env = len(env_ids)
+    count = get_curriculum(env).level[env_ids]                                   # [n]
+    order = torch.rand(n_env, len(ids["slots"]), device=env.device).argsort(dim=-1)[:, :MAX_BLOCKS]
+    pos = ids["slots"][order]                                                    # [n, 7, 3]
+    pos[..., 0] += (torch.rand(n_env, MAX_BLOCKS, device=env.device) * 2 - 1) * BLOCK_JITTER
+    pos[..., 2] += (torch.rand(n_env, MAX_BLOCKS, device=env.device) * 2 - 1) * BLOCK_JITTER
+    active = torch.arange(MAX_BLOCKS, device=env.device).unsqueeze(0) < count.unsqueeze(-1)  # [n, 7]
+    centre = torch.tensor(PAN_CENTRE, device=env.device)
+    pos = torch.where(active.unsqueeze(-1), pos, centre)
+    e = env_ids.unsqueeze(-1)
+    m = env.sim.model
+    m.body_pos[e, ids["body"]] = pos
+    m.body_mass[e, ids["body"]] = active.float() * BLOCK_MASS
+    m.body_inertia[e, ids["body"]] = active.float().unsqueeze(-1) * ids["inertia"]
+    rgba = m.geom_rgba[e, ids["geom"]]
+    rgba[..., 3] = active.float()
+    m.geom_rgba[e, ids["geom"]] = rgba
+
+
 @requires_model_fields("body_mass", "body_inertia", recompute=RecomputeLevel.set_const)
 def apply_tray_mass(env, env_ids: torch.Tensor, tray_cfg: SceneEntityCfg):
     """Set the tray mass of each resetting env from its curriculum level (uniform density)."""
@@ -247,7 +295,24 @@ class LevelVelocityCommandCfg(UniformVelocityCommandCfg):
 
 
 def loaded_tray_spec():
-    return tray.tray_spec(TRAY_STL_PATH)
+    """Tray rev9 scaled to TRAY_BASE_MASS, with MAX_BLOCKS weld-attached block bodies.
+
+    Blocks have no collision (they only carry mass); a reset event activates the first n
+    of them (mass, inertia, position, colour) and parks the rest with zero mass.
+    """
+    spec = tray.tray_spec(TRAY_STL_PATH)
+    geoms = [g for g in spec.geoms if g.name in ("tray_pan_collision", "tray_handle_left_collision",
+                                                 "tray_handle_right_collision")]
+    base = sum(g.mass for g in geoms)
+    for g in geoms:
+        g.mass = g.mass * TRAY_BASE_MASS / base
+    body = spec.body("tray")
+    h = BLOCK_SIZE / 2
+    for i in range(MAX_BLOCKS):
+        b = body.add_body(name=f"block_{i}", pos=PAN_CENTRE)
+        b.add_geom(name=f"block_{i}_geom", type=mujoco.mjtGeom.mjGEOM_BOX, size=(h, h, h),
+                   mass=BLOCK_MASS, contype=0, conaffinity=0, rgba=(0.55, 0.57, 0.6, 1.0))
+    return spec
 
 
 def loaded_tray_reset(env, env_ids: torch.Tensor, tray_cfg: SceneEntityCfg, robot_cfg: SceneEntityCfg):
@@ -410,7 +475,59 @@ def base_height_penalty(env, robot_cfg: SceneEntityCfg) -> torch.Tensor:
     return (BASE_HEIGHT_TARGET - z).clamp(min=0.0, max=BASE_HEIGHT_CAP) / BASE_HEIGHT_SCALE
 
 
+def _arm_actuator_ids(env) -> torch.Tensor:
+    ids = getattr(env, "_arm_act_ids", None)
+    if ids is None:
+        mj = env.sim.mj_model
+        names = {mj.joint(int(mj.actuator_trnid[i, 0])).name.split("/")[-1]: i for i in range(mj.nu)}
+        ids = torch.tensor([names[f"arm_{s}_{j}_joint"] for s in SIDES for j in range(1, 8)], device=env.device)
+        env._arm_act_ids = ids
+    return ids
+
+
+def arm_torque_penalty(env) -> torch.Tensor:
+    """Sum over the 14 arm joints of (|tau| / limit)^2."""
+    return _torque_ratio(env)[:, _arm_actuator_ids(env)].square().sum(dim=-1)
+
+
+def _arm7_vertical_angle(env, robot_cfg: SceneEntityCfg) -> torch.Tensor:
+    """[B, 2] angle between each arm_7 link's +y axis and world +z (0 = arm_7 level)."""
+    robot = env.scene[robot_cfg.name]
+    ids = getattr(env, "_arm7_body_ids", None)
+    if ids is None:
+        ids = [robot.find_bodies(f"arm_{s}_7_link")[0][0] for s in SIDES]
+        env._arm7_body_ids = ids
+    q = robot.data.body_link_quat_w[:, ids].reshape(-1, 4)
+    b = quat_apply(q, torch.tensor([0.0, 1.0, 0.0], device=env.device).expand(len(q), 3)).view(-1, 2, 3)
+    return torch.acos(b[..., 2].abs().clamp(max=1.0))
+
+
+def arm7_level_reward(env, robot_cfg: SceneEntityCfg) -> torch.Tensor:
+    """arm_7 +y vertical, i.e. the whole arm_7 link (long and lateral axes) horizontal."""
+    beta = _arm7_vertical_angle(env, robot_cfg)
+    wide, fine = GRIP_PARALLEL_SIGMAS
+    return (0.5 * torch.exp(-(beta / wide) ** 2) + 0.5 * torch.exp(-(beta / fine) ** 2)).mean(dim=-1)
+
+
 # Metrics (logged, not rewarded)
+def arm7_level_metric(env, robot_cfg: SceneEntityCfg, side: int) -> torch.Tensor:
+    return torch.rad2deg(_arm7_vertical_angle(env, robot_cfg)[:, side])
+
+
+def arm_torque_metric(env) -> torch.Tensor:
+    return arm_torque_penalty(env)
+
+
+def payload_offset_metric(env, tray_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Horizontal distance (cm) from the pan centre to the tray+blocks centre of mass."""
+    tray_entity = env.scene[tray_cfg.name]
+    tb = int(tray_entity.indexing.body_ids[0])
+    d = tray_entity.data
+    centre = d.root_link_pos_w + quat_apply(d.root_link_quat_w, torch.tensor(PAN_CENTRE, device=env.device).expand(env.num_envs, 3))
+    com = env.sim.data.subtree_com[:, tb]
+    return 100.0 * (com[:, :2] - centre[:, :2]).norm(dim=-1)
+
+
 def base_height_metric(env, robot_cfg: SceneEntityCfg) -> torch.Tensor:
     return env.scene[robot_cfg.name].data.root_link_pos_w[:, 2]
 
@@ -540,8 +657,8 @@ def loaded_env_cfg(play: bool = False):
     cfg.events["hold_nominal_targets"] = EventTermCfg(
         func=tray.hold_nominal_targets, mode="reset", params={"robot_cfg": SceneEntityCfg("robot")})
     cfg.events["reset_tray"] = EventTermCfg(func=loaded_tray_reset, mode="reset", params=tray_params)
-    cfg.events["tray_mass"] = EventTermCfg(
-        func=apply_tray_mass, mode="reset", params={"tray_cfg": SceneEntityCfg("tray")})
+    cfg.events["tray_blocks"] = EventTermCfg(
+        func=place_tray_blocks, mode="reset", params={"tray_cfg": SceneEntityCfg("tray")})
 
     # -- Command and curriculum: per-env speed scaling replaces the step-based stages.
     old = cfg.commands["twist"]
@@ -575,6 +692,10 @@ def loaded_env_cfg(play: bool = False):
     cfg.rewards["gripper_parallel"] = RewardTermCfg(func=gripper_parallel_reward, weight=1.0, params=tray_params)
     cfg.rewards["base_height"] = RewardTermCfg(
         func=base_height_penalty, weight=-1.0, params={"robot_cfg": SceneEntityCfg("robot")})
+    # V5: arm effort and a level arm_7 link.
+    cfg.rewards["arm_torque"] = RewardTermCfg(func=arm_torque_penalty, weight=ARM_TORQUE_WEIGHT)
+    cfg.rewards["arm7_level"] = RewardTermCfg(
+        func=arm7_level_reward, weight=1.0, params={"robot_cfg": SceneEntityCfg("robot")})
     cfg.rewards["tray_orientation"] = RewardTermCfg(
         func=loaded_tray_orientation_reward, weight=w["tray_orientation"], params=tray_params)
     cfg.rewards["tray_relative_motion"] = RewardTermCfg(
@@ -596,6 +717,11 @@ def loaded_env_cfg(play: bool = False):
     cfg.metrics["tray_roll_deg"] = MetricsTermCfg(func=tray_roll_metric, params=tray_params)
     cfg.metrics["tray_pitch_deg"] = MetricsTermCfg(func=tray_pitch_metric, params=tray_params)
     cfg.metrics["base_height_m"] = MetricsTermCfg(func=base_height_metric, params={"robot_cfg": SceneEntityCfg("robot")})
+    cfg.metrics["arm_torque_sq_sum"] = MetricsTermCfg(func=arm_torque_metric)
+    cfg.metrics["payload_offset_cm"] = MetricsTermCfg(func=payload_offset_metric, params={"tray_cfg": SceneEntityCfg("tray")})
+    for i, side in enumerate(SIDES):
+        cfg.metrics[f"arm7_tilt_{side}_deg"] = MetricsTermCfg(
+            func=arm7_level_metric, params={"robot_cfg": SceneEntityCfg("robot"), "side": i})
     for i, side in enumerate(SIDES):
         cfg.metrics[f"gripper_tilt_{side}_deg"] = MetricsTermCfg(
             func=wrist_tray_angle_metric, params={**tray_params, "side": i})

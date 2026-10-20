@@ -26,7 +26,7 @@ COMMANDS = {
     "fwd_1.0": (1.0, 0.0, 0.0), "fwd_1.2": (1.2, 0.0, 0.0), "back_0.5": (-0.5, 0.0, 0.0),
     "side_0.2": (0.0, 0.2, 0.0), "yaw_0.5": (0.0, 0.0, 0.5),
 }
-LEVELS = {1.0: 0, 3.5: 5, 6.0: 10}
+LEVELS = {1.0: 0, 4.0: 3, 6.0: 5, 8.0: 7}   # V5: total kg -> number of 1 kg blocks on the 1 kg tray
 
 
 def main() -> None:
@@ -70,7 +70,8 @@ def main() -> None:
     command = raw.command_manager.get_term("twist")
 
     body = int(raw.scene["tray"].indexing.body_ids[0])
-    masses = raw.sim.model.body_mass[:, body]
+    raw.sim.forward()
+    masses = raw.sim.model.body_subtreemass[:, body]   # tray + blocks
     assert torch.allclose(masses, L.level_mass(level)), "tray masses not applied"
 
     mj = raw.sim.mj_model
