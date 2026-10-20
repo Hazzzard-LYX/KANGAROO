@@ -80,7 +80,7 @@ def main() -> None:
     jaw_ids = [raw.scene["robot"].joint_names.index(f"gripper_{s}_finger_joint") for s in ("left", "right")]
     robot = raw.scene["robot"]
     jaw0 = robot.data.joint_pos[:, jaw_ids].clone()
-    target = L.tray.TRAY_REL_POS_TORSO.to(a.device)
+    target = L.TRAY_REL_POS_TORSO.to(a.device)
 
     alive = torch.ones(n, dtype=torch.bool, device=a.device)
     dropped = torch.zeros_like(alive)
@@ -111,9 +111,9 @@ def main() -> None:
         d = robot.data
         st = L.tray_state_torso(raw, L.SceneEntityCfg("tray"), L.SceneEntityCfg("robot"))
         tilt = torch.rad2deg(2 * torch.acos(
-            torch.abs(torch.sum(st[:, 3:7] * L.tray.TRAY_REL_QUAT.to(a.device), -1)).clamp(max=1)))
+            torch.abs(torch.sum(st[:, 3:7] * L.TRAY_REL_QUAT.to(a.device), -1)).clamp(max=1)))
         tau = raw.sim.data.actuator_force[:, arm_ids].abs() / arm_cap
-        f = raw.scene["hand_tray_contact"].data.force.norm(dim=-1).sum(-1)
+        f = raw.scene["tray_support"].data.force.norm(dim=-1).sum(-1)
         vals = dict(cnt=torch.ones(n, device=a.device),
                     evx=(d.root_link_lin_vel_b[:, 0] - cmd[:, 0]).abs(),
                     evy=(d.root_link_lin_vel_b[:, 1] - cmd[:, 1]).abs(),

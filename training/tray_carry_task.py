@@ -32,7 +32,7 @@ TRAY_REL_POS_TORSO = torch.tensor([0.3218, -0.2, -0.0856], dtype=torch.float32) 
 TRAY_REL_QUAT = torch.tensor([0.5, 0.5, 0.5, 0.5], dtype=torch.float32)
 
 
-def tray_spec() -> mujoco.MjSpec:
+def tray_spec(stl_path: Path | None = None) -> mujoco.MjSpec:
     """Build the 100 g tray with physical pan and handle contact geometry.
 
     The full concave STL is visual-only. MuJoCo collision meshes are convex, so
@@ -41,14 +41,15 @@ def tray_spec() -> mujoco.MjSpec:
     are used: grasping must come from finger contact and friction.
     """
     spec = mujoco.MjSpec()
-    spec.add_mesh(name="tray_visual", file=str(TRAY_STL_PATH), scale=[0.001] * 3)
+    stl_path = Path(stl_path or TRAY_STL_PATH)
+    spec.add_mesh(name="tray_visual", file=str(stl_path), scale=[0.001] * 3)
 
     # The STL is exported in millimetres. Each handle is the closed band between
     # y=0..100 mm at one end of x; these coordinate windows exclude the pan and
     # let MuJoCo form two small convex contact meshes instead of the whole-tray hull.
     import trimesh
 
-    tray_mesh = trimesh.load_mesh(str(TRAY_STL_PATH), process=True)
+    tray_mesh = trimesh.load_mesh(str(stl_path), process=True)
     triangles = tray_mesh.triangles
     handle_mesh_data = {}
     for side, x_range in (("left", (20.0, 80.0)), ("right", (320.0, 380.0))):
@@ -62,7 +63,7 @@ def tray_spec() -> mujoco.MjSpec:
         )
         selected = triangles[mask]
         if len(selected) == 0:
-            raise ValueError(f"No {side} handle triangles found in {TRAY_STL_PATH}")
+            raise ValueError(f"No {side} handle triangles found in {stl_path}")
         vertices = np.unique(selected.reshape(-1, 3), axis=0)
         vertex_ids = {tuple(vertex): idx for idx, vertex in enumerate(vertices)}
         faces = np.asarray(
