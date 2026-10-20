@@ -20,11 +20,19 @@ def main() -> None:
     parser.add_argument("--save-interval", type=int, default=250)
     parser.add_argument("--seed", type=int, default=47)
     parser.add_argument("--run-name", default="scratch")
+    parser.add_argument("--resume-checkpoint", type=Path, default=None,
+                        help="Load actor, critic and optimizer from this checkpoint (same experiment).")
     args = parser.parse_args()
 
     cfg = TrainConfig.from_task(loaded_carry_task.TASK_ID)
     cfg.env.scene.num_envs = args.num_envs
-    cfg.agent.resume = False
+    cfg.agent.resume = args.resume_checkpoint is not None
+    if cfg.agent.resume:
+        ck = args.resume_checkpoint.resolve()
+        if not ck.is_file():
+            parser.error(f"checkpoint not found: {ck}")
+        cfg.agent.load_run = ck.parent.name
+        cfg.agent.load_checkpoint = ck.name
     cfg.agent.max_iterations = args.iterations
     cfg.agent.save_interval = args.save_interval
     cfg.agent.run_name = args.run_name
@@ -40,19 +48,20 @@ def main() -> None:
         "num_envs": args.num_envs,
         "iterations": args.iterations,
         "seed": args.seed,
-        "resume_checkpoint": None,
+        "resume_checkpoint": None if args.resume_checkpoint is None else str(args.resume_checkpoint.resolve()),
         "run_name": args.run_name,
         "run_directory_prefix": f"logs/rsl_rl/{cfg.agent.experiment_name}/*_{args.run_name}",
         "commit": commit,
         "uncommitted_changes": True,
-        "pose_file": str(loaded_carry_task.tray.POSE_PATH),
-        "tray_mesh": str(loaded_carry_task.tray.TRAY_STL_PATH),
+        "pose_file": str(loaded_carry_task.POSE_PATH),
+        "tray_mesh": str(loaded_carry_task.TRAY_STL_PATH),
         "curriculum": {
             "levels": loaded_carry_task.N_LEVELS,
             "mass_kg": [loaded_carry_task.MASS_MIN, loaded_carry_task.MASS_MAX],
             "speed_scale": [loaded_carry_task.SPEED_SCALE_MIN, 1.0],
-            "promote_survival": loaded_carry_task.PROMOTE_SURVIVAL,
-            "demote_survival": loaded_carry_task.DEMOTE_SURVIVAL,
+            "promote_pass_rate": loaded_carry_task.PROMOTE_SURVIVAL,
+            "demote_pass_rate": loaded_carry_task.DEMOTE_SURVIVAL,
+            "pass": "full episode and mean xy velocity error < %.2f m/s" % loaded_carry_task.TRACK_PASS_ERROR,
             "replay_prob": loaded_carry_task.REPLAY_PROB,
         },
     }

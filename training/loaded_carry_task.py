@@ -71,10 +71,15 @@ SPEED_SCALE_MIN = 0.3
 FINAL_RANGES = dict(lin_vel_x=(-0.6, 1.2), lin_vel_y=(-0.2, 0.2), ang_vel_z=(-0.6, 0.6))
 FRONTIER_SIGMA = 0.7      # width of the sampling bump around the frontier (levels)
 REPLAY_PROB = 0.2         # share of resets drawn uniformly from the levels below the frontier
-PROMOTE_SURVIVAL = 0.85   # frontier survival rate that moves the frontier up
+PROMOTE_SURVIVAL = 0.85   # frontier pass rate (survive + track) that moves the frontier up
 DEMOTE_SURVIVAL = 0.50    # ... and below which it moves down
 FRONTIER_STEP = 0.1       # levels per decision
 WINDOW_EPISODES = 256     # frontier episodes per decision
+# An episode passes when it lasts the full length AND its mean xy velocity error is below this
+# (2026-10-19: survival alone let a standing-still policy reach 6 kg at full speed).
+TRACK_PASS_ERROR = 0.2    # m/s
+# Velocity tracking (2026-10-19): tighter kernels and larger weights than PAL's flat task.
+TRACK_LIN_STD, TRACK_ANG_STD, TRACK_WEIGHT = 0.25, 0.35, 3.0
 
 ARM_SCALE_FACTOR = 1.0 / 3.0  # of PAL's official arm action scales
 GRIPPER_SCALE = 0.15          # rad per unit action, around the reset jaw angle
@@ -100,10 +105,14 @@ class LoadCurriculum:
         # curriculum (e.g. episodes shortened by the runner's random initial lengths).
         self.start_step = torch.full((num_envs,), -1, dtype=torch.long, device=device)
         self.frontier = 0.0
+        self.window_passed = 0
         self.window_survived = 0
         self.window_total = 0
+        self.window_err = 0.0
         self.last_rate = float("nan")
-        self.survived_by_level = torch.zeros(N_LEVELS, device=device)
+        self.last_survival = float("nan")
+        self.last_err = float("nan")
+        self.passed_by_level = torch.zeros(N_LEVELS, device=device)
         self.total_by_level = torch.zeros(N_LEVELS, device=device)
 
     def probabilities(self) -> torch.Tensor:
@@ -117,21 +126,27 @@ class LoadCurriculum:
         replay /= replay.sum()
         return (1.0 - REPLAY_PROB) * bump + REPLAY_PROB * replay
 
-    def record(self, env_ids: torch.Tensor, survived: torch.Tensor) -> None:
+    def record(self, env_ids: torch.Tensor, passed: torch.Tensor, survived: torch.Tensor,
+               vel_err: torch.Tensor) -> None:
         lv = self.level[env_ids]
         self.total_by_level.index_add_(0, lv, torch.ones_like(lv, dtype=torch.float32))
-        self.survived_by_level.index_add_(0, lv, survived.float())
+        self.passed_by_level.index_add_(0, lv, passed.float())
         hard = lv >= math.floor(self.frontier)
         self.window_total += int(hard.sum())
+        self.window_passed += int((passed & hard).sum())
         self.window_survived += int((survived & hard).sum())
+        self.window_err += float(vel_err[hard].sum())
         if self.window_total >= WINDOW_EPISODES:
-            rate = self.window_survived / self.window_total
+            rate = self.window_passed / self.window_total
             self.last_rate = rate
+            self.last_survival = self.window_survived / self.window_total
+            self.last_err = self.window_err / self.window_total
             if rate >= PROMOTE_SURVIVAL:
                 self.frontier = min(N_LEVELS - 1.0, self.frontier + FRONTIER_STEP)
             elif rate < DEMOTE_SURVIVAL:
                 self.frontier = max(0.0, self.frontier - FRONTIER_STEP)
-            self.window_survived = self.window_total = 0
+            self.window_passed = self.window_survived = self.window_total = 0
+            self.window_err = 0.0
 
     def sample(self, env_ids: torch.Tensor, step: int) -> None:
         p = self.probabilities()
@@ -162,18 +177,26 @@ def load_curriculum(env, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
         survived = env.reset_time_outs[env_ids] & ~env.reset_terminated[env_ids] \
             & valid & (length >= env.max_episode_length - 1)
         counted = failed | survived
+        # Mean xy velocity error over the episode, from the command term's running metric
+        # (sum |v_cmd - v| / max_command_steps; reset after the curriculum runs).
+        twist = env.command_manager.get_term("twist")
+        max_cmd_steps = twist.cfg.resampling_time_range[1] / env.step_dt
+        vel_err = twist.metrics["error_vel_xy"][env_ids] * max_cmd_steps / length.clamp(min=1)
+        passed = survived & (vel_err < TRACK_PASS_ERROR)
         if counted.any():
-            cur.record(env_ids[counted], survived[counted])
+            cur.record(env_ids[counted], passed[counted], survived[counted], vel_err[counted])
     cur.sample(env_ids, step if step > 0 else -1)
-    rate_by_level = cur.survived_by_level / cur.total_by_level.clamp(min=1)
+    rate_by_level = cur.passed_by_level / cur.total_by_level.clamp(min=1)
     out = {
         "frontier": torch.tensor(cur.frontier),
-        "frontier_survival": torch.tensor(cur.last_rate),
+        "frontier_pass_rate": torch.tensor(cur.last_rate),
+        "frontier_survival": torch.tensor(cur.last_survival),
+        "frontier_vel_error": torch.tensor(cur.last_err),
         "mean_level": cur.level.float().mean(),
         "mean_mass_kg": level_mass(cur.level).mean(),
     }
     for k in range(N_LEVELS):
-        out[f"survival_L{k:02d}"] = rate_by_level[k]
+        out[f"pass_L{k:02d}"] = rate_by_level[k]
     return out
 
 
@@ -525,6 +548,10 @@ def loaded_env_cfg(play: bool = False):
     off_pose = official.rewards["pose"].params
     for key in ("std_standing", "std_walking", "std_running"):
         pose_params[key] = {n: _official_value(off_pose[key], n) for n in pose_joints}
+    cfg.rewards["track_linear_velocity"].params["std"] = TRACK_LIN_STD
+    cfg.rewards["track_linear_velocity"].weight = TRACK_WEIGHT
+    cfg.rewards["track_angular_velocity"].params["std"] = TRACK_ANG_STD
+    cfg.rewards["track_angular_velocity"].weight = TRACK_WEIGHT
     w = {"tray_position": 2.0, "tray_orientation": 1.0}
     cfg.rewards["tray_position"] = RewardTermCfg(
         func=loaded_tray_position_reward, weight=w["tray_position"], params={**tray_params, "std": 0.08})
