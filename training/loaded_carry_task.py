@@ -60,6 +60,9 @@ SUPPORT_GROUPS = {
 }
 PINCH_FORCE = 5.0          # N per fingertip for a full pinch reward
 TORQUE_LIMIT_FRAC = 0.9    # torque penalty starts at this fraction of each actuator's limit
+TRAY_TILT_SIGMA = math.radians(5.0)  # tray-level penalty width (world vertical)
+# Gripper top/bottom faces parallel to the tray bottom: coarse + fine kernel widths.
+GRIP_PARALLEL_SIGMAS = (math.radians(20.0), math.radians(3.0))
 
 # Curriculum: level k in 0..N_LEVELS-1. Mass and speed scale rise together.
 N_LEVELS = 11
@@ -328,7 +331,74 @@ def torque_limit_penalty(env) -> torch.Tensor:
     return excess.square().sum(dim=-1)
 
 
+def _tray_up_w(env, tray_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Tray up axis (CAD +y, the handle post axis) in the world frame."""
+    q = env.scene[tray_cfg.name].data.root_link_quat_w
+    return quat_apply(q, torch.tensor([0.0, 1.0, 0.0], device=env.device).expand(len(q), 3))
+
+
+def tray_tilt_penalty(env, tray_cfg: SceneEntityCfg) -> torch.Tensor:
+    """1 - exp(-(theta / sigma)^2), theta = angle between the tray up axis and world +z."""
+    theta = torch.acos(_tray_up_w(env, tray_cfg)[:, 2].clamp(-1.0, 1.0))
+    return 1.0 - torch.exp(-(theta / TRAY_TILT_SIGMA) ** 2)
+
+
+def _tray_up_heading(env, tray_cfg: SceneEntityCfg, robot_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Tray up axis in the robot heading frame (world rotated by the robot yaw only)."""
+    up = _tray_up_w(env, tray_cfg)
+    yaw = env.scene[robot_cfg.name].data.heading_w
+    c, s = torch.cos(yaw), torch.sin(yaw)
+    return torch.stack((c * up[:, 0] + s * up[:, 1], -s * up[:, 0] + c * up[:, 1], up[:, 2]), dim=-1)
+
+
+def _wrist_tray_angle(env, tray_cfg: SceneEntityCfg, robot_cfg: SceneEntityCfg) -> torch.Tensor:
+    """[B, 2] angle (rad) between each arm_7 link's +y axis and the tray up axis (left, right).
+
+    arm_7 +y is the axis of every gripper linkage joint, i.e. the normal of the gripper's
+    top/bottom faces; all fingertip pads stay perpendicular to it at any jaw opening. It is
+    parallel to the tray up axis (the handle post axis) exactly when the pads are parallel
+    to the posts.
+    """
+    robot = env.scene[robot_cfg.name]
+    ids = getattr(env, "_arm7_body_ids", None)
+    if ids is None:
+        ids = [robot.find_bodies(f"arm_{s}_7_link")[0][0] for s in SIDES]
+        env._arm7_body_ids = ids
+    q = robot.data.body_link_quat_w[:, ids].reshape(-1, 4)
+    b = quat_apply(q, torch.tensor([0.0, 1.0, 0.0], device=env.device).expand(len(q), 3)).view(-1, 2, 3)
+    u = _tray_up_w(env, tray_cfg).unsqueeze(1)
+    return torch.acos((b * u).sum(-1).abs().clamp(max=1.0))
+
+
+def gripper_parallel_reward(env, tray_cfg: SceneEntityCfg, robot_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Mean over grippers of 0.5 exp(-(b/20deg)^2) + 0.5 exp(-(b/3deg)^2), b = _wrist_tray_angle."""
+    beta = _wrist_tray_angle(env, tray_cfg, robot_cfg)
+    wide, fine = GRIP_PARALLEL_SIGMAS
+    r = 0.5 * torch.exp(-(beta / wide) ** 2) + 0.5 * torch.exp(-(beta / fine) ** 2)
+    return r.mean(dim=-1)
+
+
 # Metrics (logged, not rewarded)
+def wrist_tray_angle_metric(env, tray_cfg: SceneEntityCfg, robot_cfg: SceneEntityCfg, side: int) -> torch.Tensor:
+    return torch.rad2deg(_wrist_tray_angle(env, tray_cfg, robot_cfg)[:, side])
+
+
+def tray_tilt_metric(env, tray_cfg: SceneEntityCfg) -> torch.Tensor:
+    return torch.rad2deg(torch.acos(_tray_up_w(env, tray_cfg)[:, 2].clamp(-1.0, 1.0)))
+
+
+def tray_roll_metric(env, tray_cfg: SceneEntityCfg, robot_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Degrees, + = tray left side (robot +y) up."""
+    up = _tray_up_heading(env, tray_cfg, robot_cfg)
+    return torch.rad2deg(torch.atan2(-up[:, 1], up[:, 2]))
+
+
+def tray_pitch_metric(env, tray_cfg: SceneEntityCfg, robot_cfg: SceneEntityCfg) -> torch.Tensor:
+    """Degrees, + = tray front (robot +x) down."""
+    up = _tray_up_heading(env, tray_cfg, robot_cfg)
+    return torch.rad2deg(torch.atan2(up[:, 0], up[:, 2]))
+
+
 def support_share_metric(env, sensor_name: str, group: str) -> torch.Tensor:
     f, idx = _support_forces(env, sensor_name), _support_index(env, sensor_name)
     return (f[:, idx[(group, "left")], 2] + f[:, idx[(group, "right")], 2]) / _tray_weight(env)
@@ -455,11 +525,14 @@ def loaded_env_cfg(play: bool = False):
     off_pose = official.rewards["pose"].params
     for key in ("std_standing", "std_walking", "std_running"):
         pose_params[key] = {n: _official_value(off_pose[key], n) for n in pose_joints}
-    w = {"tray_position": 2.0, "tray_upright": 1.0, "tray_orientation": 1.0}
+    w = {"tray_position": 2.0, "tray_orientation": 1.0}
     cfg.rewards["tray_position"] = RewardTermCfg(
         func=loaded_tray_position_reward, weight=w["tray_position"], params={**tray_params, "std": 0.08})
-    cfg.rewards["tray_upright"] = RewardTermCfg(
-        func=tray.tray_upright_reward, weight=w["tray_upright"], params={"tray_cfg": SceneEntityCfg("tray")})
+    # Tray level w.r.t. gravity (2026-10-19). Replaces tray_upright (cos(tilt), nearly flat below 20 deg).
+    cfg.rewards["tray_tilt"] = RewardTermCfg(
+        func=tray_tilt_penalty, weight=-2.0, params={"tray_cfg": SceneEntityCfg("tray")})
+    # Gripper top/bottom faces parallel to the tray bottom (2026-10-19): pads parallel to the handle posts.
+    cfg.rewards["gripper_parallel"] = RewardTermCfg(func=gripper_parallel_reward, weight=1.0, params=tray_params)
     cfg.rewards["tray_orientation"] = RewardTermCfg(
         func=loaded_tray_orientation_reward, weight=w["tray_orientation"], params=tray_params)
     cfg.rewards["tray_relative_motion"] = RewardTermCfg(
@@ -477,6 +550,12 @@ def loaded_env_cfg(play: bool = False):
         cfg.metrics[f"support_{g}"] = MetricsTermCfg(func=support_share_metric, params={**sensor, "group": g})
     cfg.metrics["pinch_both_sides"] = MetricsTermCfg(func=pinch_both_metric, params=sensor)
     cfg.metrics["torque_over_90pct"] = MetricsTermCfg(func=torque_over_limit_metric)
+    cfg.metrics["tray_tilt_deg"] = MetricsTermCfg(func=tray_tilt_metric, params={"tray_cfg": SceneEntityCfg("tray")})
+    cfg.metrics["tray_roll_deg"] = MetricsTermCfg(func=tray_roll_metric, params=tray_params)
+    cfg.metrics["tray_pitch_deg"] = MetricsTermCfg(func=tray_pitch_metric, params=tray_params)
+    for i, side in enumerate(SIDES):
+        cfg.metrics[f"gripper_tilt_{side}_deg"] = MetricsTermCfg(
+            func=wrist_tray_angle_metric, params={**tray_params, "side": i})
 
     cfg.sim.nconmax = 128
     cfg.sim.njmax = 512
