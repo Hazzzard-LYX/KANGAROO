@@ -80,6 +80,9 @@ WINDOW_EPISODES = 256     # frontier episodes per decision
 TRACK_PASS_ERROR = 0.2    # m/s
 # Velocity tracking (2026-10-19): tighter kernels and larger weights than PAL's flat task.
 TRACK_LIN_STD, TRACK_ANG_STD, TRACK_WEIGHT = 0.25, 0.35, 3.0
+# Base height (2026-10-19): with 6 kg the policy crouched to 0.58 m standing (0.93 m with 1 kg).
+# One-sided linear penalty below the target, flat terrain (world z = height above ground).
+BASE_HEIGHT_TARGET, BASE_HEIGHT_SCALE, BASE_HEIGHT_CAP = 0.90, 0.10, 0.40
 
 ARM_SCALE_FACTOR = 1.0 / 3.0  # of PAL's official arm action scales
 GRIPPER_SCALE = 0.15          # rad per unit action, around the reset jaw angle
@@ -401,7 +404,17 @@ def gripper_parallel_reward(env, tray_cfg: SceneEntityCfg, robot_cfg: SceneEntit
     return r.mean(dim=-1)
 
 
+def base_height_penalty(env, robot_cfg: SceneEntityCfg) -> torch.Tensor:
+    """min(max(target - z, 0), cap) / scale: 1 per 10 cm below 0.90 m, capped at 4."""
+    z = env.scene[robot_cfg.name].data.root_link_pos_w[:, 2]
+    return (BASE_HEIGHT_TARGET - z).clamp(min=0.0, max=BASE_HEIGHT_CAP) / BASE_HEIGHT_SCALE
+
+
 # Metrics (logged, not rewarded)
+def base_height_metric(env, robot_cfg: SceneEntityCfg) -> torch.Tensor:
+    return env.scene[robot_cfg.name].data.root_link_pos_w[:, 2]
+
+
 def wrist_tray_angle_metric(env, tray_cfg: SceneEntityCfg, robot_cfg: SceneEntityCfg, side: int) -> torch.Tensor:
     return torch.rad2deg(_wrist_tray_angle(env, tray_cfg, robot_cfg)[:, side])
 
@@ -560,6 +573,8 @@ def loaded_env_cfg(play: bool = False):
         func=tray_tilt_penalty, weight=-2.0, params={"tray_cfg": SceneEntityCfg("tray")})
     # Gripper top/bottom faces parallel to the tray bottom (2026-10-19): pads parallel to the handle posts.
     cfg.rewards["gripper_parallel"] = RewardTermCfg(func=gripper_parallel_reward, weight=1.0, params=tray_params)
+    cfg.rewards["base_height"] = RewardTermCfg(
+        func=base_height_penalty, weight=-1.0, params={"robot_cfg": SceneEntityCfg("robot")})
     cfg.rewards["tray_orientation"] = RewardTermCfg(
         func=loaded_tray_orientation_reward, weight=w["tray_orientation"], params=tray_params)
     cfg.rewards["tray_relative_motion"] = RewardTermCfg(
@@ -580,6 +595,7 @@ def loaded_env_cfg(play: bool = False):
     cfg.metrics["tray_tilt_deg"] = MetricsTermCfg(func=tray_tilt_metric, params={"tray_cfg": SceneEntityCfg("tray")})
     cfg.metrics["tray_roll_deg"] = MetricsTermCfg(func=tray_roll_metric, params=tray_params)
     cfg.metrics["tray_pitch_deg"] = MetricsTermCfg(func=tray_pitch_metric, params=tray_params)
+    cfg.metrics["base_height_m"] = MetricsTermCfg(func=base_height_metric, params={"robot_cfg": SceneEntityCfg("robot")})
     for i, side in enumerate(SIDES):
         cfg.metrics[f"gripper_tilt_{side}_deg"] = MetricsTermCfg(
             func=wrist_tray_angle_metric, params={**tray_params, "side": i})
